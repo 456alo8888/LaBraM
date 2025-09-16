@@ -153,7 +153,7 @@ def main(args):
     #     ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
     # ]
 
-    datasets_train = [f"{args.pretrainingdata_dir}"]
+    datasets_train = [[f"{args.pretrainingdata_dir}"]]
 
     time_window = [4]
 
