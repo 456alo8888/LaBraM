@@ -29,7 +29,7 @@ from torch import inf
 import h5py
 
 from tensorboardX import SummaryWriter
-from data_processor.dataset import ShockDataset
+from data_processor.dataset import ShockDataset , MergedPretrainingDataset
 import pickle
 from scipy.signal import resample
 from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
@@ -703,10 +703,12 @@ def create_ds_config(args):
 def build_pretraining_dataset(datasets: list, time_window: list, stride_size=200, start_percentage=0, end_percentage=1):
     shock_dataset_list = []
     ch_names_list = []
-    for dataset_list, window_size in zip(datasets, time_window):
-        dataset = ShockDataset([Path(file_path) for file_path in dataset_list], window_size * 200, stride_size, start_percentage, end_percentage)
+    for dataset_list, window_secs in zip(datasets, time_window):
+        # dataset = ShockDataset([Path(file_path) for file_path in dataset_list], window_secs * 200, stride_size, start_percentage, end_percentage)
+        dataset = MergedPretrainingDataset([Path(file_path) for file_path in dataset_list] , windows_size_secs= window_secs , stride_size=stride_size)
         shock_dataset_list.append(dataset)
-        ch_names_list.append(dataset.get_ch_names())
+        ch_names_list = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'Fz', 'Cz', 'Pz']
+        # ch_names_list.append(dataset.get_ch_names())
     return shock_dataset_list, ch_names_list
 
 

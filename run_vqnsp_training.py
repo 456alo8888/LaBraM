@@ -33,6 +33,7 @@ def get_args():
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--save_ckpt_freq', default=20, type=int)
+    parser.add_argument('--pretrainingdata_dir', type= str , default= '/home/user01/aiotlab/pqhung/CBraMod/data/dummy_data_ica_rescale')
     # Model parameters
     parser.add_argument('--model', default='vqnsp_encoder_base_decoder_3x200x12', type=str, metavar='MODEL',  help='Name of model to train')  
 
@@ -146,17 +147,23 @@ def main(args):
 
     # get dataset
     # datasets with the same montage can be packed within a sublist
-    datasets_train = [
-        ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
-        ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
-    ]
+    
+    # datasets_train = [
+    #     ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
+    #     ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
+    # ]
+
+    datasets_train = [f"{args.pretrainingdata_dir}"]
+
+    time_window = [4]
+
     # time window for each sublist in dataset_train
     # to ensure the total sequence length be around 256 for each dataset
-    time_window = [
-        4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
-        8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
-    ]
-    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window, stride_size=200)
+    # time_window = [
+    #     4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
+    #     8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
+    # ]
+    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window)
 
     datasets_val = [
         ["path/to/datasets_val"]

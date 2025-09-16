@@ -5,6 +5,11 @@ from typing import List
 from torch.utils.data import Dataset
 
 
+import torch
+import pickle 
+import lmdb 
+
+
 list_path = List[Path]
 
 class SingleShockDataset(Dataset):
@@ -127,3 +132,113 @@ class ShockDataset(Dataset):
     
     def get_ch_names(self):
         return self.__datasets[0].get_ch_names()
+    
+
+
+
+# class MergedPretrainingDataset(Dataset):
+#     def __init__(
+#             self,
+#             dataset_dirs: List[str]
+#     ):
+#         super(MergedPretrainingDataset, self).__init__()
+#         self.dbs = [lmdb.open(dataset_dir, readonly=True, lock=False, readahead=True, meminit=False) for dataset_dir in dataset_dirs]
+#         self.keys = []
+#         for db_idx, db in enumerate(self.dbs):
+#             with db.begin(write=False) as txn:
+#                 raw = txn.get('__keys__'.encode())
+#                 if raw is None:
+#                     continue
+#                 keys = pickle.loads(raw)
+#                 # Store (key, db_idx) pairs
+#                 self.keys.extend((k, db_idx) for k in keys)
+#         # self.keys = self.keys[:100000]
+
+#     def __len__(self):
+#         return len(self.keys)
+
+#     def __getitem__(self, idx):
+#         key, db_idx = self.keys[idx]
+
+#         with self.dbs[db_idx].begin(write=False) as txn:
+#             key_bytes = key if isinstance(key, bytes) else key.encode()
+#             raw = txn.get(key_bytes)
+#             if raw is None:
+#                 raise KeyError(f"Key '{key}' not found in LMDB index {db_idx}")
+#             patch = pickle.loads(raw)
+
+#         patch = to_tensor(patch)
+#         # print(patch.shape)
+#         return patch
+
+
+
+def to_tensor(x):
+    # bạn có thể thay đổi tùy data
+    return torch.tensor(x, dtype=torch.float32)
+
+class MergedPretrainingDataset(Dataset):
+    """
+    Giống ShockDataset nhưng dữ liệu lưu trong LMDB.
+    Mỗi key trong LMDB có thể chứa 1 đoạn dài (vd: 30s), 
+    ta sẽ cắt thành nhiều windows ngắn hơn.
+    """
+    def __init__(self, dataset_dirs, window_size_secs=4, stride_size=200, sample_rate=200, feature_size=None, ch_names=None):
+        super().__init__()
+        self.dbs = [lmdb.open(dataset_dir, readonly=True, lock=False, readahead=True, meminit=False) 
+                    for dataset_dir in dataset_dirs]
+
+        self.window_size = window_size_secs * sample_rate
+        self.stride_size = stride_size
+        
+        # lưu mapping index toàn cục -> (db_idx, key, start_offset)
+        self.index_map = []
+        for db_idx, db in enumerate(self.dbs):
+            with db.begin(write=False) as txn:
+                raw = txn.get('__keys__'.encode())
+                if raw is None:
+                    continue
+                keys = pickle.loads(raw)
+
+            for key in keys:
+                with db.begin(write=False) as txn:
+                    patch = pickle.loads(txn.get(key.encode() if isinstance(key, str) else key))
+                length = patch.shape[1]  # số sample theo time
+                # số windows có thể sinh ra
+                num_windows = (length - self.window_size) // self.stride_size + 1
+                for w in range(num_windows):
+                    start = w * self.stride_size
+                    self.index_map.append((db_idx, key, start))
+
+        self._feature_size = feature_size
+        self._ch_names = ch_names
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        db_idx, key, start = self.index_map[idx]
+        with self.dbs[db_idx].begin(write=False) as txn:
+            raw = txn.get(key if isinstance(key, bytes) else key.encode())
+            patch = pickle.loads(raw)
+
+        window = patch[:, start:start+self.window_size]
+        window = to_tensor(window)
+
+        if self._feature_size is None:
+            self._feature_size = list(window.shape)
+        return window
+
+    @property
+    def feature_size(self):
+        return self._feature_size
+
+    def get_ch_names(self):
+        if self._ch_names is None:
+            raise ValueError("Channel names (ch_names) không được lưu trong LMDB. "
+                             "Bạn cần truyền vào khi tạo dataset.")
+        return self._ch_names
+
+    def free(self):
+        for db in self.dbs:
+            db.close()

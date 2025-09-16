@@ -1,6 +1,12 @@
 import h5py
 import mne
 import numpy as np
+import torch
+
+
+
+def to_tensor(array):
+    return torch.from_numpy(array).float()
 
 
 def preprocessing_cnt(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200):
@@ -58,6 +64,7 @@ def readh5(h5filePath):
         else: 
             np_array = dset[()]
     return np_array
+
 
 
 if __name__ == '__main__':

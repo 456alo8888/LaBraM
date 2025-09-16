@@ -52,6 +52,8 @@ The tokenizer is trained via **vector-quantized neural spectrum prediction (VQ-N
 ```bash
 OMP_NUM_THREADS=1 torchrun --nnodes=1 --nproc_per_node=8 run_vqnsp_training.py \
     --output_dir ./checkpoints/vqnsp/ \
+    --pretrainingdata_dir '/home/user01/aiotlab/pqhung/EEG/108CMH' \
+    --disable_eval True \
     --log_dir ./log/vqnsp/ \
     --model vqnsp_encoder_base_decoder_3x200x12 \
     --codebook_n_emd 8192 \
@@ -75,6 +77,7 @@ Pre-train LaBraM by reconstructing masked neural codes from EEG channel patches:
 ```bash
 OMP_NUM_THREADS=1 torchrun --nnodes=1 --nproc_per_node=8 run_labram_pretraining.py \
     --output_dir ./checkpoints/labram_base \
+    --pretrainingdata_dir '/home/user01/aiotlab/pqhung/EEG/108CMH' \
     --log_dir ./log/labram_base \
     --model labram_base_patch200_1600_8k_vocab \
     --tokenizer_model vqnsp_encoder_base_decoder_3x200x12 \
