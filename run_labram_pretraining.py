@@ -27,6 +27,9 @@ from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 import modeling_pretrain
 import modeling_vqnsp
+import wandb 
+
+wandb.login(key = "") #add your key to see 
 
 def get_args():
     parser = argparse.ArgumentParser('LaBraM pre-training script', add_help=False)
@@ -154,150 +157,155 @@ def main(args):
 
     print(args)
 
-    device = torch.device(args.device)
+    config = vars(args)
+    with wandb.init(project = "labram-pretraining" , config = config):
 
-    # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    # random.seed(seed)
+        device = torch.device(args.device)
 
-    cudnn.benchmark = True
+        # fix the seed for reproducibility
+        seed = args.seed + utils.get_rank()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        # random.seed(seed)
 
-    model = get_model(args)
-    patch_size = model.patch_size
-    print("Patch size = %s" % str(patch_size))
-    args.window_size = (1, args.input_size // patch_size)
-    args.patch_size = patch_size
+        cudnn.benchmark = True
 
-    # get dataset
-    # datasets with the same montage can be packed within a sublist
-    # datasets_train = [
-    #     ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
-    #     ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
-    # ]
-    # # time window for each sublist in dataset_train
-    # # to ensure the total sequence length be around 256 for each dataset
-    # time_window = [
-    #     4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
-    #     8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
-    # ]
+        model = get_model(args)
+        patch_size = model.patch_size
+        print("Patch size = %s" % str(patch_size))
+        args.window_size = (1, args.input_size // patch_size)
+        args.patch_size = patch_size
+
+        # get dataset
+        # datasets with the same montage can be packed within a sublist
+        # datasets_train = [
+        #     ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
+        #     ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
+        # ]
+        # # time window for each sublist in dataset_train
+        # # to ensure the total sequence length be around 256 for each dataset
+        # time_window = [
+        #     4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
+        #     8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
+        # ]
 
 
-    
-    datasets_train = [f"{args.pretrainingdata_dir}"]
+        
+        datasets_train = [f"{args.pretrainingdata_dir}"]
 
-    time_window = [4]
+        time_window = [4]
 
-    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window, stride_size=800, start_percentage=0, end_percentage=1)
-    # prepare visual tokenizer
-    vqnsp = get_visual_tokenizer(args).to(device)
+        dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window, stride_size=800, start_percentage=0, end_percentage=1)
+        # prepare visual tokenizer
+        vqnsp = get_visual_tokenizer(args).to(device)
 
-    if True:  # args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
-        sampler_rank = global_rank
-        num_training_steps_per_epoch = sum([len(dataset) for dataset in dataset_train_list]) // args.batch_size // num_tasks
+        if True:  # args.distributed:
+            num_tasks = utils.get_world_size()
+            global_rank = utils.get_rank()
+            sampler_rank = global_rank
+            num_training_steps_per_epoch = sum([len(dataset) for dataset in dataset_train_list]) // args.batch_size // num_tasks
 
-        sampler_train_list = []
-        for dataset in dataset_train_list:
-            sampler_train = torch.utils.data.DistributedSampler(
-                dataset, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
+            sampler_train_list = []
+            for dataset in dataset_train_list:
+                sampler_train = torch.utils.data.DistributedSampler(
+                    dataset, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
+                )
+                sampler_train_list.append(sampler_train)
+            print("Sampler_train = %s" % str(sampler_train))
+        else:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
+
+        if global_rank == 0 and args.log_dir is not None:
+            os.makedirs(args.log_dir, exist_ok=True)
+            log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
+        else:
+            log_writer = None
+
+        data_loader_train_list = []
+        for dataset, sampler in zip(dataset_train_list, sampler_train_list):
+            data_loader_train = torch.utils.data.DataLoader(
+                dataset, sampler=sampler,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                drop_last=True,
             )
-            sampler_train_list.append(sampler_train)
-        print("Sampler_train = %s" % str(sampler_train))
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+            data_loader_train_list.append(data_loader_train)
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    else:
-        log_writer = None
+        model.to(device)
+        model_without_ddp = model
+        n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    data_loader_train_list = []
-    for dataset, sampler in zip(dataset_train_list, sampler_train_list):
-        data_loader_train = torch.utils.data.DataLoader(
-            dataset, sampler=sampler,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=True,
-        )
-        data_loader_train_list.append(data_loader_train)
+        print("Model = %s" % str(model_without_ddp))
+        print('number of params:', n_parameters)
 
-    model.to(device)
-    model_without_ddp = model
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print("Tokenizer = %s" % str(vqnsp))
+        total_batch_size = args.batch_size * utils.get_world_size() * args.gradient_accumulation_steps
+        print("LR = %.8f" % args.lr)
+        print("Batch size = %d" % total_batch_size)
+        print("Number of training steps = %d" % num_training_steps_per_epoch)
+        print("Number of training examples per epoch = %d" % (total_batch_size * num_training_steps_per_epoch))
 
-    print("Model = %s" % str(model_without_ddp))
-    print('number of params:', n_parameters)
-
-    print("Tokenizer = %s" % str(vqnsp))
-    total_batch_size = args.batch_size * utils.get_world_size() * args.gradient_accumulation_steps
-    print("LR = %.8f" % args.lr)
-    print("Batch size = %d" % total_batch_size)
-    print("Number of training steps = %d" % num_training_steps_per_epoch)
-    print("Number of training examples per epoch = %d" % (total_batch_size * num_training_steps_per_epoch))
-
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-
-    optimizer = create_optimizer(
-        args, model_without_ddp)
-    loss_scaler = NativeScaler()
-
-    print("Use step level LR & WD scheduler!")
-    lr_schedule_values = utils.cosine_scheduler(
-        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-        warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-    )
-    if args.weight_decay_end is None:
-        args.weight_decay_end = args.weight_decay
-    wd_schedule_values = utils.cosine_scheduler(
-        args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
-
-    utils.auto_load_model(
-        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
-
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            for data_loader_train in data_loader_train_list:
-                data_loader_train.sampler.set_epoch(epoch)
-        if log_writer is not None:
-            log_writer.set_step(epoch * num_training_steps_per_epoch)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+            model_without_ddp = model.module
 
-        train_stats = train_one_epoch(
-            model, vqnsp, data_loader_train_list,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, log_writer=log_writer,
-            start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values,
-            wd_schedule_values=wd_schedule_values,
-            ch_names_list=train_ch_names_list,
-            args=args,
+        optimizer = create_optimizer(
+            args, model_without_ddp)
+        loss_scaler = NativeScaler()
+
+        print("Use step level LR & WD scheduler!")
+        lr_schedule_values = utils.cosine_scheduler(
+            args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
+            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
         )
-        if args.output_dir:
-            utils.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch, save_ckpt_freq=args.save_ckpt_freq)
+        if args.weight_decay_end is None:
+            args.weight_decay_end = args.weight_decay
+        wd_schedule_values = utils.cosine_scheduler(
+            args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+        print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch, 'n_parameters': n_parameters}
+        utils.auto_load_model(
+            args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-        if args.output_dir and utils.is_main_process():
+        print(f"Start training for {args.epochs} epochs")
+        start_time = time.time()
+        wandb.watch(model , log = 'all' , log_freq=10)
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                for data_loader_train in data_loader_train_list:
+                    data_loader_train.sampler.set_epoch(epoch)
             if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+                log_writer.set_step(epoch * num_training_steps_per_epoch)
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+            train_stats = train_one_epoch(
+                model, vqnsp, data_loader_train_list,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, log_writer=log_writer,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+                wd_schedule_values=wd_schedule_values,
+                ch_names_list=train_ch_names_list,
+                args=args,
+            )
+            wandb.log(train_stats)
+            if args.output_dir:
+                utils.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, save_ckpt_freq=args.save_ckpt_freq)
+
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        'epoch': epoch, 'n_parameters': n_parameters}
+
+            if args.output_dir and utils.is_main_process():
+                if log_writer is not None:
+                    log_writer.flush()
+                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':

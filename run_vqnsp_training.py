@@ -16,6 +16,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
+import wandb 
 
 from pathlib import Path
 
@@ -27,6 +28,8 @@ from utils import NativeScalerWithGradNormCount as NativeScaler
 import modeling_vqnsp
 import utils
 
+
+wandb.login(key = "") #add key for log result  
 
 def get_args():
     parser = argparse.ArgumentParser('LaBraM pre-training script', add_help=False)
@@ -130,213 +133,215 @@ def get_model(args, **kwargs):
 
 def main(args):
     utils.init_distributed_mode(args)
-
     print(args)
+    config = vars(args)
+    with wandb.init(project = "vqnsp-training" , config = config):
+        wandb.config = config 
+        device = torch.device(args.device)
 
-    device = torch.device(args.device)
+        # fix the seed for reproducibility
+        seed = args.seed + utils.get_rank()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        # random.seed(seed)
 
-    # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    # random.seed(seed)
+        cudnn.benchmark = True
 
-    cudnn.benchmark = True
+        model = get_model(args)
 
-    model = get_model(args)
+        # get dataset
+        # datasets with the same montage can be packed within a sublist
+        
+        # datasets_train = [
+        #     ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
+        #     ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
+        # ]
 
-    # get dataset
-    # datasets with the same montage can be packed within a sublist
-    
-    # datasets_train = [
-    #     ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
-    #     ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
-    # ]
+        datasets_train = [[f"{args.pretrainingdata_dir}"]]
 
-    datasets_train = [[f"{args.pretrainingdata_dir}"]]
+        time_window = [4]
 
-    time_window = [4]
+        # time window for each sublist in dataset_train
+        # to ensure the total sequence length be around 256 for each dataset
+        # time_window = [
+        #     4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
+        #     8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
+        # ]
+        dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window)
 
-    # time window for each sublist in dataset_train
-    # to ensure the total sequence length be around 256 for each dataset
-    # time_window = [
-    #     4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
-    #     8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
-    # ]
-    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window)
-
-    datasets_val = [
-        ["path/to/datasets_val"]
-    ]
-    if args.disable_eval:
-        dataset_val_list = None
-    else:
-        dataset_val_list, val_ch_names_list = utils.build_pretraining_dataset(datasets_val, [4])
-
-    if True:  # args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
-        sampler_rank = global_rank
-        num_training_steps_per_epoch = sum([len(dataset) for dataset in dataset_train_list]) // args.batch_size // num_tasks
-
-        sampler_train_list = []
-        for dataset in dataset_train_list:
-            sampler_train = torch.utils.data.DistributedSampler(
-                dataset, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
-            )
-            sampler_train_list.append(sampler_train)
-
-        print("Sampler_train = %s" % str(sampler_train))
-        sampler_eval_list = []
-        if args.dist_eval:
-            # if len(dataset_val) % num_tasks != 0:
-            #     print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-            #           'This will slightly alter validation results as extra duplicate entries are added to achieve '
-            #           'equal num of samples per-process.')
-            for dataset in dataset_val_list:
-                sampler_val = torch.utils.data.DistributedSampler(
-                    dataset, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-                sampler_eval_list.append(sampler_val)
+        datasets_val = [
+            ["path/to/datasets_val"]
+        ]
+        if args.disable_eval:
+            dataset_val_list = None
         else:
-            for dataset in dataset_val_list:
-                sampler_val = torch.utils.data.SequentialSampler(dataset)
-                sampler_eval_list.append(sampler_val)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+            dataset_val_list, val_ch_names_list = utils.build_pretraining_dataset(datasets_val, [4])
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    else:
-        log_writer = None
+        if True:  # args.distributed:
+            num_tasks = utils.get_world_size()
+            global_rank = utils.get_rank()
+            sampler_rank = global_rank
+            num_training_steps_per_epoch = sum([len(dataset) for dataset in dataset_train_list]) // args.batch_size // num_tasks
 
-    data_loader_train_list = []
-    for dataset, sampler in zip(dataset_train_list, sampler_train_list):
-        data_loader_train = torch.utils.data.DataLoader(
-            dataset, sampler=sampler,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=True,
-        )
-        data_loader_train_list.append(data_loader_train)
+            sampler_train_list = []
+            for dataset in dataset_train_list:
+                sampler_train = torch.utils.data.DistributedSampler(
+                    dataset, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
+                )
+                sampler_train_list.append(sampler_train)
 
-    if dataset_val_list is not None:
-        data_loader_val_list = []
-        for dataset, sampler in zip(dataset_val_list, sampler_eval_list):
-            data_loader_val = torch.utils.data.DataLoader(
+            print("Sampler_train = %s" % str(sampler_train))
+            sampler_eval_list = []
+            if args.dist_eval:
+                # if len(dataset_val) % num_tasks != 0:
+                #     print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                #           'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                #           'equal num of samples per-process.')
+                for dataset in dataset_val_list:
+                    sampler_val = torch.utils.data.DistributedSampler(
+                        dataset, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+                    sampler_eval_list.append(sampler_val)
+            else:
+                for dataset in dataset_val_list:
+                    sampler_val = torch.utils.data.SequentialSampler(dataset)
+                    sampler_eval_list.append(sampler_val)
+        else:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+        if global_rank == 0 and args.log_dir is not None:
+            os.makedirs(args.log_dir, exist_ok=True)
+            log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
+        else:
+            log_writer = None
+
+        data_loader_train_list = []
+        for dataset, sampler in zip(dataset_train_list, sampler_train_list):
+            data_loader_train = torch.utils.data.DataLoader(
                 dataset, sampler=sampler,
-                batch_size=int(1.5 * args.batch_size),
+                batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 pin_memory=args.pin_mem,
-                drop_last=False
+                drop_last=True,
             )
-            data_loader_val_list.append(data_loader_val)
-    else:
-        data_loader_val_list = None
+            data_loader_train_list.append(data_loader_train)
 
-    model.to(device)
-    model_without_ddp = model
-    if not args.eval:
-        print("Model = %s" % str(model_without_ddp))
-    for part in ['encoder', 'decoder']:
-        model_part = eval(f"model.{part}")
-        n_learnable_parameters = sum(p.numel() for p in model_part.parameters() if p.requires_grad)
-        n_fix_parameters = sum(p.numel() for p in model_part.parameters() if not p.requires_grad)
-        print(f'number of learnable params in model.{part}: {n_learnable_parameters / 1e6} M')
-        print(f'number of fixed params in model.{part}: {n_fix_parameters / 1e6} M')
-
-    n_learnable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_fix_parameters = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    print(f'total number of learnable params: {n_learnable_parameters / 1e6} M')
-    print(f'total number of fixed params in : {n_fix_parameters / 1e6} M')
-
-    total_batch_size = args.batch_size * utils.get_world_size()
-    args.lr = total_batch_size / 128 * args.lr
-    print("LR = %.8f" % args.lr)
-    print("Min LR = %.8f" % args.min_lr)
-    print("Weigth Decay = %.8f" % args.weight_decay)
-    print("Batch size = %d" % total_batch_size)
-    print("Number of training steps = %d" % num_training_steps_per_epoch)
-    print("Number of training examples per epoch = %d" % (total_batch_size * num_training_steps_per_epoch))
-
-    optimizer = create_optimizer(args, model_without_ddp)
-    loss_scaler = NativeScaler()
-
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-
-    print("Use step level LR & WD scheduler!")
-    lr_schedule_values = utils.cosine_scheduler(
-        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-        warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-    )
-
-    utils.auto_load_model(
-        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
-            
-    if args.eval:
-        test_stats = evaluate(data_loader_val, model, device, log_writer, 0, args=args)
-        exit(0)
-        
-    if args.calculate_codebook_usage:
-        test_stats = calculate_codebook_usage(data_loader_val, model, device, log_writer, 0, args=args)
-        exit(0)
-        
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-            
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            for data_loader_train in data_loader_train_list:
-                data_loader_train.sampler.set_epoch(epoch)
-        if log_writer is not None:
-            log_writer.set_step(epoch * num_training_steps_per_epoch)
-        train_stats = train_one_epoch(
-            model, 
-            data_loader_train_list,
-            optimizer, 
-            device, 
-            epoch, 
-            loss_scaler,
-            args.clip_grad, 
-            log_writer=log_writer,
-            start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values,
-            ch_names_list=train_ch_names_list,
-            args=args
-        )
-        if args.output_dir:
-            # if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
-            utils.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch, save_ckpt_freq=args.save_ckpt_freq)
-        
-        if data_loader_val_list is not None:
-            test_stats = evaluate(data_loader_val_list, model, device, log_writer, epoch, ch_names_list=val_ch_names_list, args=args)
-            print(f"Validation loss of the network on the {sum([len(dataset) for dataset in dataset_val_list])} test EEG: {test_stats['loss']:.4f}")
-
-            if log_writer is not None:
-                log_writer.update(**test_stats, head="val/loss")
-                
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch, 'n_parameters': n_learnable_parameters}
+        if dataset_val_list is not None:
+            data_loader_val_list = []
+            for dataset, sampler in zip(dataset_val_list, sampler_eval_list):
+                data_loader_val = torch.utils.data.DataLoader(
+                    dataset, sampler=sampler,
+                    batch_size=int(1.5 * args.batch_size),
+                    num_workers=args.num_workers,
+                    pin_memory=args.pin_mem,
+                    drop_last=False
+                )
+                data_loader_val_list.append(data_loader_val)
         else:
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch, 'n_parameters': n_learnable_parameters}
+            data_loader_val_list = None
 
-        if args.output_dir and utils.is_main_process():
+        model.to(device)
+        model_without_ddp = model
+        if not args.eval:
+            print("Model = %s" % str(model_without_ddp))
+        for part in ['encoder', 'decoder']:
+            model_part = eval(f"model.{part}")
+            n_learnable_parameters = sum(p.numel() for p in model_part.parameters() if p.requires_grad)
+            n_fix_parameters = sum(p.numel() for p in model_part.parameters() if not p.requires_grad)
+            print(f'number of learnable params in model.{part}: {n_learnable_parameters / 1e6} M')
+            print(f'number of fixed params in model.{part}: {n_fix_parameters / 1e6} M')
+
+        n_learnable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_fix_parameters = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        print(f'total number of learnable params: {n_learnable_parameters / 1e6} M')
+        print(f'total number of fixed params in : {n_fix_parameters / 1e6} M')
+
+        total_batch_size = args.batch_size * utils.get_world_size()
+        args.lr = total_batch_size / 128 * args.lr
+        print("LR = %.8f" % args.lr)
+        print("Min LR = %.8f" % args.min_lr)
+        print("Weigth Decay = %.8f" % args.weight_decay)
+        print("Batch size = %d" % total_batch_size)
+        print("Number of training steps = %d" % num_training_steps_per_epoch)
+        print("Number of training examples per epoch = %d" % (total_batch_size * num_training_steps_per_epoch))
+
+        optimizer = create_optimizer(args, model_without_ddp)
+        loss_scaler = NativeScaler()
+
+        if args.distributed:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+            model_without_ddp = model.module
+
+        print("Use step level LR & WD scheduler!")
+        lr_schedule_values = utils.cosine_scheduler(
+            args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
+            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
+        )
+
+        utils.auto_load_model(
+            args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+                
+        if args.eval:
+            test_stats = evaluate(data_loader_val, model, device, log_writer, 0, args=args)
+            exit(0)
+            
+        if args.calculate_codebook_usage:
+            test_stats = calculate_codebook_usage(data_loader_val, model, device, log_writer, 0, args=args)
+            exit(0)
+            
+        print(f"Start training for {args.epochs} epochs")
+        start_time = time.time()
+        wandb.watch(models=model, log = "all" , log_freq=10)
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                for data_loader_train in data_loader_train_list:
+                    data_loader_train.sampler.set_epoch(epoch)
             if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+                log_writer.set_step(epoch * num_training_steps_per_epoch)
+            train_stats = train_one_epoch(
+                model, 
+                data_loader_train_list,
+                optimizer, 
+                device, 
+                epoch, 
+                loss_scaler,
+                args.clip_grad, 
+                log_writer=log_writer,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+                ch_names_list=train_ch_names_list,
+                args=args
+            )
+            wandb.log(train_stats)
+            if args.output_dir:
+                # if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
+                utils.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, save_ckpt_freq=args.save_ckpt_freq)
+            
+            if data_loader_val_list is not None:
+                test_stats = evaluate(data_loader_val_list, model, device, log_writer, epoch, ch_names_list=val_ch_names_list, args=args)
+                print(f"Validation loss of the network on the {sum([len(dataset) for dataset in dataset_val_list])} test EEG: {test_stats['loss']:.4f}")
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+                if log_writer is not None:
+                    log_writer.update(**test_stats, head="val/loss")
+                    
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                            **{f'test_{k}': v for k, v in test_stats.items()},
+                            'epoch': epoch, 'n_parameters': n_learnable_parameters}
+            else:
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                            'epoch': epoch, 'n_parameters': n_learnable_parameters}
+
+            if args.output_dir and utils.is_main_process():
+                if log_writer is not None:
+                    log_writer.flush()
+                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
